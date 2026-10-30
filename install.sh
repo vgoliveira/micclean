@@ -8,6 +8,7 @@
 #   SOURCE_MIC     nome do microfone, como aparece em Ajustes > Som > Entrada (padrão: ME6S)
 #   MICCLEAN_ARGS  opções extras para o micclean (ex.: "--gain 3 --strength 1.5")
 #   NO_HAMMERSPOON=1  não instala/configura o Hammerspoon (troca automática do microfone padrão)
+#   NO_DF=1        não compila nem usa o DeepFilterNet3 (rede neural; exige Rust e alguns minutos)
 #
 # Exemplo:
 #   SOURCE_MIC="Blue Yeti" MICCLEAN_ARGS="--gain 3" bash install.sh
@@ -46,6 +47,32 @@ if ! system_profiler SPAudioDataType 2>/dev/null | grep -q "BlackHole 2ch"; then
   fi
 fi
 
+# DeepFilterNet3: compila a biblioteca uma vez e guarda em ./deepfilter
+DF_COMMIT="d375b2d8309e0935d165700c91da9de862a99c31"
+if [ "${NO_DF:-0}" != "1" ] && [ ! -f deepfilter/libdf.dylib ]; then
+  echo "Preparando o DeepFilterNet3 (só na primeira vez; leva alguns minutos)..."
+  if ! command -v cargo >/dev/null; then
+    if command -v brew >/dev/null; then
+      brew install rust
+    else
+      echo "ERRO: Rust (cargo) não encontrado. Instale o Rust ou rode com NO_DF=1." >&2
+      exit 1
+    fi
+  fi
+  if [ ! -d vendor/DeepFilterNet/.git ]; then
+    rm -rf vendor/DeepFilterNet
+    mkdir -p vendor/DeepFilterNet
+    git -C vendor/DeepFilterNet init -q
+    git -C vendor/DeepFilterNet remote add origin https://github.com/Rikorose/DeepFilterNet.git
+  fi
+  git -C vendor/DeepFilterNet fetch -q --depth 1 origin "$DF_COMMIT"
+  git -C vendor/DeepFilterNet checkout -q FETCH_HEAD
+  (cd vendor/DeepFilterNet && cargo build --release -p deep_filter --no-default-features --features capi)
+  mkdir -p deepfilter
+  cp vendor/DeepFilterNet/target/release/libdf.dylib deepfilter/
+  cp vendor/DeepFilterNet/models/DeepFilterNet3_onnx.tar.gz deepfilter/
+fi
+
 echo "1/5 Compilando..."
 swiftc -O -target "$(uname -m)-apple-macos13" micclean.swift -o micclean
 
@@ -57,6 +84,13 @@ done
 pkill -x micclean 2>/dev/null || true
 mkdir -p "$APP/Contents/MacOS"
 cp micclean "$APP/Contents/MacOS/micclean"
+rm -rf "$APP/Contents/Frameworks" "$APP/Contents/Resources"
+if [ "${NO_DF:-0}" != "1" ] && [ -f deepfilter/libdf.dylib ]; then
+  mkdir -p "$APP/Contents/Frameworks" "$APP/Contents/Resources"
+  cp deepfilter/libdf.dylib "$APP/Contents/Frameworks/"
+  cp deepfilter/DeepFilterNet3_onnx.tar.gz "$APP/Contents/Resources/"
+  codesign --force --sign - "$APP/Contents/Frameworks/libdf.dylib"
+fi
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -83,6 +117,7 @@ pkill -x micclean 2>/dev/null || true
 
 echo "4/5 Configurando para iniciar com o Mac..."
 mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+[ "${NO_DF:-0}" = "1" ] && MICCLEAN_ARGS="$MICCLEAN_ARGS --no-df"
 ARGS_XML="    <string>$(printf '%s' "$APP/Contents/MacOS/micclean" | xml_escape)</string>
     <string>--source</string>
     <string>$(printf '%s' "$SOURCE_MIC" | xml_escape)</string>"

@@ -1,8 +1,8 @@
 // micclean.swift — microfone virtual com redução de eco e ruído para macOS
 //
 // Caminho do som:
-//   microfone → processamento de voz da Apple (Isolamento de Voz) → redução de reverberação
-//             → noise gate → ganho/limitador → EQ → BlackHole 2ch
+//   microfone → processamento de voz da Apple (Isolamento de Voz) → DeepFilterNet3 (IA)
+//             → redução de reverberação → noise gate → ganho/limitador → EQ → BlackHole 2ch
 // Nos apps (Meet, Slack, WhatsApp...), use "BlackHole 2ch" (ou "Padrão do sistema").
 //
 // Compilar:  swiftc -O -target "$(uname -m)-apple-macos13" micclean.swift -o micclean
@@ -41,14 +41,18 @@ func usage() -> String {
       --sink NOME         saída virtual (padrão: BlackHole 2ch)
       --no-dereverb       desliga a redução de reverberação
       --rt60 S            tempo de reverberação estimado da sala, em s (padrão: 1.5)
-      --strength X        intensidade da redução de reverberação (padrão: 2.0; teste 0.5 a 3.0)
-      --floor DB          atenuação máxima da reverberação por frequência (padrão: -25)
+      --strength X        intensidade da redução de reverberação (padrão: 2.0; 1.0 com DeepFilterNet3)
+      --floor DB          atenuação máxima da reverberação por frequência (padrão: -25; -15 com DeepFilterNet3)
       --no-vp             não usa o processamento de voz da Apple (Isolamento de Voz)
+      --no-df             não usa o DeepFilterNet3 (rede neural de redução de ruído/eco)
+      --df-atten DB       atenuação máxima do DeepFilterNet3 (padrão: 100 = sem limite)
+      --df-lib PATH       caminho da libdf.dylib (padrão: dentro do app ou ./deepfilter)
+      --df-model PATH     caminho do modelo DeepFilterNet3_onnx.tar.gz
       --no-eq             desliga a equalização
       --gain DB           ganho de saída (padrão: 6; um limitador evita distorção)
       --presence DB       reforço de clareza em 3,5 kHz (padrão: 6)
       --no-gate           desliga o noise gate
-      --gate DB           limiar do gate em dBFS (padrão: -45)
+      --gate DB           limiar do gate em dBFS (padrão: -45; -38 com DeepFilterNet3)
       --gate-range DB     atenuação com o gate fechado (padrão: -45)
       --gate-hold MS      tempo que o gate segura aberto após a fala (padrão: 150)
       --gate-release MS   velocidade de fechamento do gate (padrão: 60)
@@ -273,6 +277,11 @@ final class Ring {
         lock.initialize(to: os_unfair_lock())
     }
 
+    var available: Int {
+        os_unfair_lock_lock(lock); defer { os_unfair_lock_unlock(lock) }
+        return n
+    }
+
     func write(_ p: UnsafePointer<Float>, _ count: Int) {
         os_unfair_lock_lock(lock); defer { os_unfair_lock_unlock(lock) }
         for i in 0..<count {
@@ -488,6 +497,92 @@ final class Limiter {
     }
 }
 
+// MARK: - DeepFilterNet3 (rede neural de redução de ruído e reverberação)
+//
+// Carregada em tempo de execução (dlopen) a partir da biblioteca libdf.dylib do projeto
+// DeepFilterNet (MIT/Apache-2.0). Se a biblioteca ou o modelo não forem encontrados,
+// o MicClean segue sem ela.
+
+final class DeepFilter {
+    private typealias CreateFn = @convention(c) (UnsafePointer<CChar>, Float, UnsafePointer<CChar>?) -> OpaquePointer?
+    private typealias FrameLenFn = @convention(c) (OpaquePointer) -> Int
+    private typealias ProcessFn = @convention(c) (OpaquePointer, UnsafeMutablePointer<Float>,
+                                                  UnsafeMutablePointer<Float>) -> Float
+    private let state: OpaquePointer
+    private let processFn: ProcessFn
+    let frameLength: Int
+
+    init(libPath: String, modelPath: String, attenLimDB: Float) throws {
+        func err(_ m: String) -> NSError {
+            NSError(domain: "micclean", code: 10, userInfo: [NSLocalizedDescriptionKey: m])
+        }
+        guard FileManager.default.fileExists(atPath: modelPath) else { throw err("modelo não encontrado em \(modelPath)") }
+        guard let h = dlopen(libPath, RTLD_NOW | RTLD_LOCAL) else {
+            throw err("não foi possível carregar \(libPath): \(dlerror().map { String(cString: $0) } ?? "?")")
+        }
+        guard let c = dlsym(h, "df_create"), let f = dlsym(h, "df_get_frame_length"),
+              let p = dlsym(h, "df_process_frame") else { throw err("funções do DeepFilterNet não encontradas") }
+        let create = unsafeBitCast(c, to: CreateFn.self)
+        let frameLen = unsafeBitCast(f, to: FrameLenFn.self)
+        processFn = unsafeBitCast(p, to: ProcessFn.self)
+        guard let st = modelPath.withCString({ create($0, attenLimDB, nil) }) else { throw err("falha ao criar o modelo") }
+        state = st
+        frameLength = frameLen(st)
+    }
+
+    func process(_ input: UnsafeMutablePointer<Float>, _ output: UnsafeMutablePointer<Float>) {
+        _ = processFn(state, input, output)
+    }
+}
+
+/// Roda o DeepFilterNet3 numa thread própria, fora das threads de áudio em tempo real:
+/// captura → `input` → [DeepFilterNet3, blocos de 10 ms] → `output` → saída.
+final class DFWorker {
+    private let df: DeepFilter
+    private let input: Ring
+    private let output: Ring
+    private let inBuf: UnsafeMutablePointer<Float>
+    private let outBuf: UnsafeMutablePointer<Float>
+
+    init(df: DeepFilter, input: Ring, output: Ring) {
+        self.df = df
+        self.input = input
+        self.output = output
+        inBuf = .allocate(capacity: df.frameLength)
+        outBuf = .allocate(capacity: df.frameLength)
+    }
+
+    func start() {
+        let t = Thread { [self] in
+            let n = df.frameLength
+            while true {
+                while input.available >= n {
+                    input.read(inBuf, n, maxFill: 1 << 30)
+                    df.process(inBuf, outBuf)
+                    output.write(outBuf, n)
+                }
+                usleep(2000)
+            }
+        }
+        t.qualityOfService = .userInteractive
+        t.name = "micclean.deepfilter"
+        t.start()
+    }
+}
+
+func findDeepFilterFile(_ name: String, override: String?) -> String? {
+    if let o = override { return o }
+    let exe = URL(fileURLWithPath: Bundle.main.executablePath ?? CommandLine.arguments[0])
+        .resolvingSymlinksInPath().deletingLastPathComponent()
+    let candidates = [
+        exe.appendingPathComponent("../Frameworks/\(name)").path,           // dentro do MicClean.app
+        exe.appendingPathComponent("../Resources/\(name)").path,
+        exe.appendingPathComponent("deepfilter/\(name)").path,              // ao lado do executável
+        FileManager.default.currentDirectoryPath + "/deepfilter/\(name)",
+    ]
+    return candidates.first { FileManager.default.fileExists(atPath: $0) }
+}
+
 // MARK: - Medidor de nível
 
 final class Meter {
@@ -514,12 +609,18 @@ struct Config {
     var gateHoldMs: Float = 150
     var gateReleaseMs: Float = 60
     var meter = false
+    var deepFilter = true
+    var dfAttenDB: Float = 100
+    var dfLib: String? = nil
+    var dfModel: String? = nil
+    var explicit: Set<String> = []          // opções passadas na linha de comando
 }
 
 func parseArgs() -> Config {
     var c = Config()
     var it = CommandLine.arguments.dropFirst().makeIterator()
     while let a = it.next() {
+        c.explicit.insert(a)
         switch a {
         case "--source": c.source = it.next() ?? c.source
         case "--sink": c.sink = it.next() ?? c.sink
@@ -537,6 +638,10 @@ func parseArgs() -> Config {
         case "--gate-range": c.gateRangeDB = Float(it.next() ?? "") ?? c.gateRangeDB
         case "--meter": c.meter = true
         case "--no-vp": c.voiceProcessing = false
+        case "--no-df": c.deepFilter = false
+        case "--df-atten": c.dfAttenDB = Float(it.next() ?? "") ?? c.dfAttenDB
+        case "--df-lib": c.dfLib = it.next()
+        case "--df-model": c.dfModel = it.next()
         case "--list": listDevices(); exit(0)
         case "-h", "--help": print(usage()); exit(0)
         default: fail("opção desconhecida: \(a)\n\(usage())")
@@ -547,7 +652,7 @@ func parseArgs() -> Config {
 
 // MARK: - Programa principal
 
-let cfg = parseArgs()
+var cfg = parseArgs()
 
 guard let srcID = findDevice(cfg.source, input: true) else {
     listDevices(); fail("microfone '\(cfg.source)' não encontrado.")
@@ -578,6 +683,32 @@ if chosen == nil {
 let capture = chosen!
 
 let SR = capture.sampleRate
+
+// ---- DeepFilterNet3 ----
+var deepFilter: DeepFilter?
+var dfStatus = "desligado"
+if cfg.deepFilter {
+    if SR != 48000 {
+        dfStatus = "desligado (exige 48 kHz; o microfone está em \(Int(SR)) Hz)"
+    } else if let lib = findDeepFilterFile("libdf.dylib", override: cfg.dfLib),
+              let model = findDeepFilterFile("DeepFilterNet3_onnx.tar.gz", override: cfg.dfModel) {
+        do {
+            deepFilter = try DeepFilter(libPath: lib, modelPath: model, attenLimDB: cfg.dfAttenDB)
+            dfStatus = "ligado"
+        } catch {
+            dfStatus = "desligado (\(error.localizedDescription))"
+        }
+    } else {
+        dfStatus = "desligado (libdf.dylib ou modelo não encontrados)"
+    }
+}
+// Com a rede neural fazendo a limpeza principal, a redução de reverberação e o gate ficam mais suaves
+if deepFilter != nil {
+    if !cfg.explicit.contains("--strength") { cfg.strength = 1.0 }
+    if !cfg.explicit.contains("--floor") { cfg.floorDB = -15 }
+    if !cfg.explicit.contains("--gate") { cfg.gateDB = -38 }
+}
+
 let monoFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: SR, channels: 1, interleaved: false)!
 let ring = Ring(capacity: Int(SR))
 let gate = Gate(enabled: cfg.gate, thresholdDB: cfg.gateDB, rangeDB: cfg.gateRangeDB,
@@ -587,9 +718,16 @@ let dereverb = Dereverb(enabled: cfg.dereverb, sampleRate: SR, rt60: cfg.rt60, s
                         floorDB: cfg.floorDB)
 let meter = Meter()
 let maxFill = Int(SR * 0.04)   // até ~40 ms de folga entre captura e saída
+let dfInput = Ring(capacity: Int(SR))
+var dfWorker: DFWorker?
+if let df = deepFilter {
+    dfWorker = DFWorker(df: df, input: dfInput, output: ring)
+    dfWorker?.start()
+}
+let dfActive = dfWorker != nil
 
 capture.handler = { p, n in
-    ring.write(p, n)
+    if dfActive { dfInput.write(p, n) } else { ring.write(p, n) }
     var sum: Float = 0
     for i in 0..<n { sum += p[i] * p[i] }
     let db = 10 * log10f(sum / Float(max(n, 1)) + 1e-12)
@@ -640,6 +778,7 @@ print("""
 micclean rodando
   origem:  \(cfg.source) (\(Int(SR)) Hz)
   processamento de voz Apple: \(capture.voiceProcessing ? "ligado" : "desligado")
+  DeepFilterNet3 (IA): \(dfStatus)
   saída:   \(cfg.sink)   ← escolha este como microfone nos apps
   redução de reverberação: \(cfg.dereverb ? String(format: "RT60 %.1f s, intensidade %.1f, limite %.0f dB", cfg.rt60, cfg.strength, cfg.floorDB) : "desligada")
   gate: \(cfg.gate ? String(format: "%.0f dBFS, fechado %.0f dB", cfg.gateDB, cfg.gateRangeDB) : "desligado")   EQ: \(cfg.eq ? String(format: "ligado, clareza +%.0f dB", cfg.presenceDB) : "desligado")   ganho: \(String(format: "%+.0f dB", cfg.gainDB))

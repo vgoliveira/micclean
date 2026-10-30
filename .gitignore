@@ -1,3 +1,5 @@
 micclean
 *.o
 .DS_Store
+vendor/
+deepfilter/

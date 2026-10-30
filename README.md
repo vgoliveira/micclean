@@ -11,16 +11,17 @@ It was built as a free alternative to paid tools like Krisp, for the common case
 ## How it works
 
 ```
-USB mic ──► Apple voice processing ──► dereverb ──► noise gate ──► gain + limiter ──► EQ ──► BlackHole 2ch ──► your apps
-           (enables Voice Isolation)  (spectral)                                                (virtual mic)
+USB mic ──► Apple voice processing ──► DeepFilterNet3 ──► dereverb ──► noise gate ──► gain + limiter ──► EQ ──► BlackHole 2ch ──► your apps
+           (enables Voice Isolation)   (neural network)   (spectral, gentle)                                      (virtual mic)
 ```
 
 1. **Apple voice processing** (`VoiceProcessingIO`): the same engine FaceTime uses. Because MicClean runs as a real app, macOS lets you turn on **Voice Isolation** for it in Control Center, an ML model that separates your voice from the room. This does most of the heavy lifting.
-2. **Dereverberation**: spectral subtraction of late reverberation (Lebart et al., 2001), with gain smoothing across time and frequency to avoid "musical noise".
-3. **Noise gate**: closes in pauses so the room tail doesn't linger between sentences.
-4. **Gain + limiter**: brings the voice to a comfortable level without clipping.
-5. **EQ**: high-pass at 90 Hz, cut at 250 Hz (less boxiness), presence boost at 3.5 kHz (clarity).
-6. **BlackHole 2ch** carries the result to other apps as a regular input device.
+2. **DeepFilterNet3**: an open-source neural network (MIT/Apache-2.0) for noise and reverb suppression. It runs on a background thread in 10 ms frames (~30 ms of model latency, a small fraction of one CPU core). Because it does the heavy cleanup, the spectral dereverb and the gate below run in a gentler mode, which avoids the metallic sound of aggressive spectral processing.
+3. **Dereverberation**: spectral subtraction of late reverberation (Lebart et al., 2001), with gain smoothing across time and frequency to avoid "musical noise".
+4. **Noise gate**: closes in pauses so the room tail doesn't linger between sentences.
+5. **Gain + limiter**: brings the voice to a comfortable level without clipping.
+6. **EQ**: high-pass at 90 Hz, cut at 250 Hz (less boxiness), presence boost at 3.5 kHz (clarity).
+7. **BlackHole 2ch** carries the result to other apps as a regular input device.
 
 An optional [Hammerspoon](https://www.hammerspoon.org/) script switches the system default input automatically: **BlackHole** when your mic is plugged in, the **built-in mic** when it's not.
 
@@ -39,7 +40,8 @@ Measured on a condenser USB mic in an untreated home office (~1.5 s reverb):
 
 - macOS 13 or later (Apple Silicon or Intel)
 - Xcode Command Line Tools (`xcode-select --install`)
-- [Homebrew](https://brew.sh) (used to install BlackHole and Hammerspoon)
+- [Homebrew](https://brew.sh) (used to install BlackHole, Hammerspoon and Rust)
+- Rust, to build the DeepFilterNet3 library on first install (installed automatically via Homebrew; takes a few minutes). Skip it with `NO_DF=1`.
 
 ## Install
 
@@ -61,6 +63,7 @@ During install:
 2. macOS asks for **microphone permission for MicClean**: click **Allow**, then press Enter.
 3. MicClean is registered as a login service (`launchd`) that starts with your Mac and restarts automatically if it stops (for example, when you unplug the mic).
 4. Hammerspoon is installed and configured (skip with `NO_HAMMERSPOON=1`).
+5. On the first run, DeepFilterNet3 is downloaded and compiled into `./deepfilter` and bundled into the app (skip with `NO_DF=1`).
 
 Then:
 
@@ -87,11 +90,13 @@ launchctl bootout gui/$(id -u)/io.github.vgoliveira.micclean
 | `--source NAME` | `ME6S` | Input microphone |
 | `--sink NAME` | `BlackHole 2ch` | Virtual output device |
 | `--no-vp` | | Disable Apple voice processing |
-| `--strength X` | `2.0` | Dereverb strength (0.5–3.0) |
-| `--floor DB` | `-25` | Max dereverb attenuation per frequency |
+| `--no-df` | | Disable DeepFilterNet3 |
+| `--df-atten DB` | `100` | Max DeepFilterNet3 attenuation (100 = unlimited) |
+| `--strength X` | `2.0` (`1.0` with DeepFilterNet3) | Dereverb strength (0.5–3.0) |
+| `--floor DB` | `-25` (`-15` with DeepFilterNet3) | Max dereverb attenuation per frequency |
 | `--rt60 S` | `1.5` | Estimated room reverb time |
 | `--no-dereverb` | | Disable dereverberation |
-| `--gate DB` | `-45` | Gate threshold (dBFS) |
+| `--gate DB` | `-45` (`-38` with DeepFilterNet3) | Gate threshold (dBFS) |
 | `--gate-range DB` | `-45` | Attenuation when the gate is closed |
 | `--gate-hold MS` | `150` | Time the gate stays open after speech |
 | `--gate-release MS` | `60` | Gate closing speed |
@@ -123,7 +128,8 @@ This removes the service, the app and the Hammerspoon integration. BlackHole and
 ## Limitations
 
 - Software can't fully remove room echo. Placing the mic **5–10 cm from your mouth** (on the correct side, since many USB condensers are side-address) and adding soft materials to the room help more than any setting. A dynamic microphone picks up much less room sound.
-- Adds roughly 20–40 ms of latency.
+- Adds roughly 50–70 ms of latency with DeepFilterNet3 (20–40 ms without it).
+- DeepFilterNet3 requires the microphone to run at 48 kHz; otherwise MicClean falls back to processing without it.
 - Ad-hoc signed (no Apple Developer ID); built and installed locally from source.
 - Program messages are in Portuguese.
 
@@ -131,6 +137,7 @@ This removes the service, the app and the Hammerspoon integration. BlackHole and
 
 - [BlackHole](https://github.com/ExistentialAudio/BlackHole) by Existential Audio (virtual audio driver, installed separately)
 - [Hammerspoon](https://www.hammerspoon.org/) (automatic input switching)
+- [DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) by Hendrik Schröter (MIT/Apache-2.0): H. Schröter et al., *"DeepFilterNet: Perceptually Motivated Real-Time Speech Enhancement"*, Interspeech 2023. Downloaded and built at install time; not included in this repository.
 - Dereverberation based on K. Lebart, J. M. Boucher, P. N. Denbigh, *"A New Method Based on Spectral Subtraction for Speech Dereverberation"*, Acta Acustica, 2001.
 
 ## License
