@@ -1,0 +1,3 @@
+micclean
+*.o
+.DS_Store
